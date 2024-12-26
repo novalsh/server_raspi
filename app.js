@@ -12,8 +12,8 @@ app.use(express.json());
 const dbPath = path.resolve(__dirname, 'weight_sensor.db');
 const db = new sqlite3.Database(dbPath);
 
-// Konfigurasi VPS
-const VPS_URL = 'http://your-vps-ip:port/api/weight-data'; // Ganti dengan URL VPS Anda
+// Konfigurasi URL VPS
+const VPS_URL = 'http://your-vps-ip:port/api/data'; // Ganti dengan URL VPS Anda
 
 // Inisialisasi Database
 db.serialize(() => {
@@ -32,7 +32,9 @@ db.serialize(() => {
 // Function untuk mengirim data ke VPS
 const sendToVPS = async (data) => {
     try {
+        console.log('Sending data to VPS:', data); // Debugging log
         const response = await axios.post(VPS_URL, data);
+        console.log('Response from VPS:', response.data); // Debugging log
         return response.status === 200;
     } catch (error) {
         console.error('Error sending to VPS:', error.message);
@@ -65,7 +67,11 @@ const retrySendingFailedData = async () => {
                     UPDATE weight_measurements 
                     SET is_sent_to_vps = 1 
                     WHERE id = ?
-                `, [row.id]);
+                `, [row.id], (err) => {
+                    if (err) {
+                        console.error('Error updating sent status:', err);
+                    }
+                });
             }
         }
     });
@@ -87,14 +93,19 @@ const getLastValidMeasurement = () => {
     });
 };
 
-// Route untuk menerima data dari ESP8266
+// Route untuk menerima data dari sensor (misalnya ESP8266)
 app.post('/api/data', async (req, res) => {
     try {
         const { weight, status } = req.body;
+
+        if (!weight || !status || isNaN(parseFloat(weight))) {
+            return res.status(400).json({ message: 'Invalid data received' });
+        }
+
         const weightValue = parseFloat(weight);
-        
+
         // Check untuk anomali (weight > 5kg)
-        const is_anomaly = weightValue > 5000; // assuming weight in grams
+        const is_anomaly = weightValue > 5000; // Asumsi weight dalam gram
 
         // Simpan data ke database
         db.run(`
@@ -133,7 +144,7 @@ app.post('/api/data', async (req, res) => {
             }
         });
 
-        // Response ke ESP8266
+        // Response ke sensor
         if (is_anomaly) {
             const lastValid = await getLastValidMeasurement();
             if (lastValid) {
@@ -164,6 +175,7 @@ app.post('/api/data', async (req, res) => {
 // Coba kirim ulang data yang gagal setiap 5 menit
 setInterval(retrySendingFailedData, 5 * 60 * 1000);
 
+// Jalankan server
 const PORT = process.env.PORT || 83;
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on port ${PORT}`);
