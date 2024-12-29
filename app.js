@@ -27,7 +27,40 @@ db.serialize(() => {
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     `);
+    db.run(`
+        CREATE TABLE IF NOT EXISTS settings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            targetWeight REAL DEFAULT 5000
+        )
+    `);
+
+    // Insert default targetWeight jika belum ada
+    db.get(`SELECT COUNT(*) AS count FROM settings`, (err, row) => {
+        if (row.count === 0) {
+            db.run(`INSERT INTO settings (targetWeight) VALUES (5000)`);
+        }
+    });
 });
+
+// Function untuk mendapatkan targetWeight
+const getTargetWeight = () => {
+    return new Promise((resolve, reject) => {
+        db.get(`SELECT targetWeight FROM settings LIMIT 1`, (err, row) => {
+            if (err) reject(err);
+            resolve(row.targetWeight);
+        });
+    });
+};
+
+// Function untuk mengatur targetWeight
+const setTargetWeight = (newWeight) => {
+    return new Promise((resolve, reject) => {
+        db.run(`UPDATE settings SET targetWeight = ?`, [newWeight], (err) => {
+            if (err) reject(err);
+            resolve();
+        });
+    });
+};
 
 // Function untuk mengirim data ke VPS
 const sendToVPS = async (data) => {
@@ -42,57 +75,6 @@ const sendToVPS = async (data) => {
     }
 };
 
-// Function untuk mencoba mengirim ulang data yang belum terkirim
-const retrySendingFailedData = async () => {
-    db.all(`
-        SELECT id, weight, status, timestamp 
-        FROM weight_measurements 
-        WHERE is_sent_to_vps = 0 AND is_anomaly = 0
-        ORDER BY timestamp ASC
-    `, async (err, rows) => {
-        if (err) {
-            console.error('Error getting unsent data:', err);
-            return;
-        }
-
-        for (const row of rows) {
-            const success = await sendToVPS({
-                weight: row.weight,
-                status: row.status,
-                timestamp: row.timestamp
-            });
-
-            if (success) {
-                db.run(`
-                    UPDATE weight_measurements 
-                    SET is_sent_to_vps = 1 
-                    WHERE id = ?
-                `, [row.id], (err) => {
-                    if (err) {
-                        console.error('Error updating sent status:', err);
-                    }
-                });
-            }
-        }
-    });
-};
-
-// Function untuk mendapatkan data terakhir yang valid
-const getLastValidMeasurement = () => {
-    return new Promise((resolve, reject) => {
-        db.get(`
-            SELECT weight, status, timestamp 
-            FROM weight_measurements 
-            WHERE is_anomaly = 0 
-            ORDER BY timestamp DESC 
-            LIMIT 1
-        `, (err, row) => {
-            if (err) reject(err);
-            resolve(row);
-        });
-    });
-};
-
 // Route untuk menerima data dari sensor (misalnya ESP8266)
 app.post('/api/data', async (req, res) => {
     try {
@@ -103,9 +85,10 @@ app.post('/api/data', async (req, res) => {
         }
 
         const weightValue = parseFloat(weight);
+        const targetWeight = await getTargetWeight();
 
-        // Check untuk anomali (weight > 5kg)
-        const is_anomaly = weightValue > 5000; // Asumsi weight dalam gram
+        // Check untuk anomali (weight > targetWeight)
+        const is_anomaly = weightValue > targetWeight;
 
         // Simpan data ke database
         db.run(`
@@ -121,49 +104,22 @@ app.post('/api/data', async (req, res) => {
                 const success = await sendToVPS({
                     weight: weightValue,
                     status: status,
+                    targetWeight: targetWeight,
                     timestamp: new Date().toISOString()
                 });
 
                 if (success) {
-                    db.run(`
-                        UPDATE weight_measurements 
-                        SET is_sent_to_vps = 1 
-                        WHERE id = ?
-                    `, [this.lastID]);
-                }
-            } else {
-                // Jika anomali, coba kirim data terakhir yang valid
-                const lastValid = await getLastValidMeasurement();
-                if (lastValid) {
-                    await sendToVPS({
-                        weight: lastValid.weight,
-                        status: lastValid.status,
-                        timestamp: lastValid.timestamp
-                    });
+                    db.run(`UPDATE weight_measurements SET is_sent_to_vps = 1 WHERE id = ?`, [this.lastID]);
                 }
             }
         });
 
-        // Response ke sensor
-        if (is_anomaly) {
-            const lastValid = await getLastValidMeasurement();
-            if (lastValid) {
-                return res.json({
-                    weight: lastValid.weight,
-                    status: lastValid.status,
-                    timestamp: lastValid.timestamp,
-                    message: 'Anomaly detected, returned last valid measurement'
-                });
-            }
-            return res.json({
-                message: 'Anomaly detected, no valid previous measurement found'
-            });
-        }
-
         return res.json({
             message: 'Data received successfully',
             weight: weightValue,
-            status: status
+            targetWeight: targetWeight,
+            status: status,
+            is_anomaly: is_anomaly
         });
 
     } catch (error) {
@@ -172,8 +128,23 @@ app.post('/api/data', async (req, res) => {
     }
 });
 
-// Coba kirim ulang data yang gagal setiap 5 menit
-setInterval(retrySendingFailedData, 5 * 60 * 1000);
+// Route untuk mengatur targetWeight
+app.post('/api/targetWeight', async (req, res) => {
+    try {
+        const { targetWeight } = req.body;
+
+        if (!targetWeight || isNaN(parseFloat(targetWeight))) {
+            return res.status(400).json({ message: 'Invalid target weight' });
+        }
+
+        await setTargetWeight(parseFloat(targetWeight));
+        return res.json({ message: 'Target weight updated successfully' });
+
+    } catch (error) {
+        console.error('Error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
 
 // Jalankan server
 const PORT = process.env.PORT || 83;
